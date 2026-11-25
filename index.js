@@ -2,6 +2,7 @@ import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import { createDatabaseClient } from "./src/config/database.js";
+import { errorHandler } from "./src/middleware/errorHandler.js";
 
 const app = express();
 const port = Number(process.env.PORT) || 5000;
@@ -43,6 +44,7 @@ async function startServer() {
 
     // Handles unknown API paths without falling through to a Next.js route.
     app.use("/api", (_req, res) => res.status(404).json({ message: "API route not found." }));
+    app.use(errorHandler);
     app.listen(port, () => console.log(`Server listening on port ${port}`));
   } catch (error) {
     console.error("Could not connect to MongoDB:", error.message);
