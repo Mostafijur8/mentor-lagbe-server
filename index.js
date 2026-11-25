@@ -3,10 +3,12 @@ import express from "express";
 import cors from "cors";
 import { createDatabaseClient } from "./src/config/database.js";
 import { errorHandler } from "./src/middleware/errorHandler.js";
+import { requestLogger } from "./src/middleware/requestLogger.js";
 
 const app = express();
 const port = Number(process.env.PORT) || 5000;
 const mongoUri = process.env.MONGODB_URI;
+app.use(requestLogger);
 
 // Applies CORS before routes and accepts JSON for normal API requests.
 const allowedOrigins = (process.env.CLIENT_ORIGIN || "http://localhost:3000")
