@@ -39,3 +39,14 @@ The API listens on `http://localhost:5000` by default.
 ## Database collections
 
 The application uses exactly four MongoDB collections: `users`, `tuitions`, `applications`, and `payments`.
+
+## Main API routes
+
+| Area | Routes |
+| --- | --- |
+| Health | `GET /api/health` |
+| Authentication | `POST /api/auth/signup`, `POST /api/auth/signin`, `GET /api/auth/me` |
+| Tuitions | `GET /api/tuitions`, `GET /api/tuitions/:id`, `POST/PATCH/DELETE /api/tuitions` |
+| Applications | `POST/DELETE /api/applications`, `PATCH /api/applications/:id/status` |
+| Payments | `POST /api/payments/checkout`, `POST /api/payments/verify` |
+| Administration | `/api/admin/users`, `/api/admin/tuitions`, `/api/admin/payments` |
