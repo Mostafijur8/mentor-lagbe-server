@@ -395,6 +395,25 @@ router.get("/student/bookmarks", verifyToken, verifyStudent, async (req, res) =>
   res.json(items.map(serializeDocument));
 });
 
+// Adds a 1–5 star review when the student has an accepted application.
+router.post("/tuitions/:tuitionId/reviews", verifyToken, verifyStudent, async (req, res) => {
+  const tuitionId = toObjectId(req.params.tuitionId);
+  const rating = Number(req.body.rating);
+  if (!tuitionId || !Number.isInteger(rating) || rating < 1 || rating > 5) return res.status(400).json({ message: "Rating must be an integer from 1 to 5." });
+  const collections = req.app.locals.collections;
+  const student = await collections.users.findOne({ _id: toObjectId(req.user.sub) });
+  const accepted = await collections.applications.findOne({ tuitionId: tuitionId.toString(), studentEmail: student?.email, status: "accepted" });
+  if (!accepted) return res.status(403).json({ message: "Only students with an accepted application can review this tuition." });
+
+  const review = { studentName: student.name, studentEmail: student.email, rating, comment: String(req.body.comment || "").trim(), createdAt: new Date() };
+  const result = await collections.tuitions.updateOne(
+    { _id: tuitionId, "reviews.studentEmail": { $ne: student.email } },
+    { $push: { reviews: review } },
+  );
+  if (!result.modifiedCount) return res.status(409).json({ message: "You have already reviewed this tuition." });
+  res.status(201).json(review);
+});
+
 // Seeds realistic connected demo data without using a second database collection.
 router.post("/seed", async (req, res) => {
   if (process.env.SEED_SECRET && req.headers["x-seed-secret"] !== process.env.SEED_SECRET) return res.status(401).json({ message: "Invalid seed secret." });
