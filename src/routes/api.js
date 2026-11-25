@@ -4,8 +4,9 @@ import jwt from 'jsonwebtoken';
 import Stripe from 'stripe';
 import { verifyToken, verifyStudent, verifyTutor, verifyAdmin } from '../middleware/auth.js';
 import { imageUpload } from '../middleware/upload.js';
-import { toObjectId, serializeDocument } from '../utils/helpers.js';
+import { toObjectId, serializeDocument, escapeRegex } from '../utils/helpers.js';
 import { uploadToImgBB } from '../utils/imgbb.js';
+import { seedDemoData } from '../utils/seed.js';
 
 const router = Router();
 
@@ -104,6 +105,13 @@ router.patch('/users/profile', verifyToken, async (req, res) => {
   );
   if (!result) return res.status(404).json({ message: 'User not found.' });
   const { password: _password, ...safeUser } = result;
+
+  // Mirror editable identity fields into the Better Auth profile.
+  const authUpdate = { updatedAt: new Date().toISOString() };
+  if (update.name) authUpdate.name = update.name;
+  if (update.image !== undefined) authUpdate.image = update.image;
+  await req.app.locals.db.collection('user').updateOne({ email: result.email }, { $set: authUpdate });
+
   res.json(safeUser);
 });
 
@@ -123,12 +131,18 @@ router.post('/upload/image', verifyToken, imageUpload.single('image'), async (re
 // Searches, filters, paginates, and lists public approved tuition posts.
 router.get('/tuitions', async (req, res) => {
   const { search = '', subject, classLevel, mode, page = '1', limit = '12', featured } = req.query;
-  const filter = { approvalStatus: 'approved', isActive: true };
-  if (search)
+  const baseFilter = { approvalStatus: 'approved', isActive: true };
+  const filter = { ...baseFilter };
+  const term = String(search).trim();
+  if (term) {
+    const pattern = new RegExp(escapeRegex(term), 'i');
     filter.$or = [
-      { title: { $regex: search, $options: 'i' } },
-      { subject: { $regex: search, $options: 'i' } },
+      { title: pattern },
+      { subject: pattern },
+      { tutorName: pattern },
+      { location: pattern },
     ];
+  }
   if (subject) filter.subject = subject;
   if (classLevel) filter.classLevel = classLevel;
   if (mode) filter.mode = mode;
@@ -140,19 +154,30 @@ router.get('/tuitions', async (req, res) => {
     const items = await collection.find(filter).sort({ createdAt: -1 }).limit(pageSize).toArray();
     return res.json(items.map(serializeDocument));
   }
-  const total = await collection.countDocuments(filter);
-  const items = await collection
-    .find(filter)
-    .sort({ createdAt: -1 })
-    .skip((pageNumber - 1) * pageSize)
-    .limit(pageSize)
-    .toArray();
+
+  const [total, items, subjects, classLevels] = await Promise.all([
+    collection.countDocuments(filter),
+    collection
+      .find(filter)
+      .sort({ createdAt: -1 })
+      .skip((pageNumber - 1) * pageSize)
+      .limit(pageSize)
+      .toArray(),
+    collection.distinct('subject', baseFilter),
+    collection.distinct('classLevel', baseFilter),
+  ]);
+
   res.json({
     tuitions: items.map(serializeDocument),
     page: pageNumber,
     limit: pageSize,
     total,
     totalPages: Math.ceil(total / pageSize),
+    facets: {
+      subjects: subjects.sort((a, b) => a.localeCompare(b)),
+      classLevels: classLevels.sort((a, b) => a.localeCompare(b)),
+      modes: ['Online', 'Offline'],
+    },
   });
 });
 
@@ -444,6 +469,15 @@ router.patch('/admin/users/:id/role', verifyToken, verifyAdmin, async (req, res)
     { returnDocument: 'after', projection: { password: 0 } },
   );
   if (!result) return res.status(404).json({ message: 'User not found.' });
+
+  // Keep Better Auth's copy aligned so a future session sees the same role.
+  await req.app.locals.db
+    .collection('user')
+    .updateOne(
+      { email: result.email },
+      { $set: { role: req.body.role, updatedAt: new Date().toISOString() } },
+    );
+
   res.json(serializeDocument(result));
 });
 
@@ -480,12 +514,21 @@ router.post('/payments/checkout', verifyToken, async (req, res) => {
   const collections = req.app.locals.collections;
   const user = await collections.users.findOne({ _id: toObjectId(req.user.sub) });
   if (!user) return res.status(404).json({ message: 'User not found.' });
+  if (!['student', 'tutor'].includes(user.role))
+    return res.status(403).json({ message: 'Only students and tutors can upgrade to Pro.' });
+  if (user.plan === 'pro')
+    return res.status(409).json({ message: 'This account is already on the Pro plan.' });
+
   const amount = user.role === 'tutor' ? 1500 : 1000;
+  const clientOrigin = (process.env.CLIENT_ORIGIN || 'http://localhost:3000')
+    .split(',')[0]
+    .trim();
   const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
   const session = await stripe.checkout.sessions.create({
     mode: 'payment',
-    payment_method_types: ['card'],
+    allowed_payment_method_types: ['card'],
     customer_email: user.email,
+    client_reference_id: user._id.toString(),
     line_items: [
       {
         price_data: {
@@ -504,8 +547,8 @@ router.post('/payments/checkout', verifyToken, async (req, res) => {
       userRole: user.role,
       planName: 'Pro',
     },
-    success_url: `${process.env.CLIENT_ORIGIN || 'http://localhost:3000'}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
-    cancel_url: `${process.env.CLIENT_ORIGIN || 'http://localhost:3000'}/payment/cancel`,
+    success_url: `${clientOrigin}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
+    cancel_url: `${clientOrigin}/payment/cancel`,
   });
   res.status(201).json({ url: session.url, sessionId: session.id });
 });
@@ -521,14 +564,33 @@ router.post('/payments/verify', verifyToken, async (req, res) => {
   if (session.payment_status !== 'paid')
     return res.status(402).json({ message: 'Payment is not complete.' });
 
+  // A session can only activate the plan of the account that created it.
+  const ownerId = session.metadata?.userId || session.client_reference_id;
+  if (!ownerId || ownerId !== req.user.sub)
+    return res.status(403).json({ message: 'This payment does not belong to your account.' });
+
   const collections = req.app.locals.collections;
-  const userId = toObjectId(session.metadata?.userId || req.user.sub);
+  const userId = toObjectId(ownerId);
   const user = await collections.users.findOne({ _id: userId });
   if (!user) return res.status(404).json({ message: 'User not found.' });
+
+  const alreadyUsed = await collections.payments.findOne({
+    stripeSessionId: session.id,
+    userEmail: { $ne: user.email },
+  });
+  if (alreadyUsed)
+    return res.status(409).json({ message: 'This payment has already been processed.' });
+
   await collections.users.updateOne(
     { _id: userId },
     { $set: { plan: 'pro', updatedAt: new Date() } },
   );
+  await req.app.locals.db
+    .collection('user')
+    .updateOne(
+      { email: user.email },
+      { $set: { plan: 'pro', updatedAt: new Date().toISOString() } },
+    );
 
   const existing = await collections.payments.findOne({ stripeSessionId: session.id });
   if (!existing) {
@@ -536,7 +598,7 @@ router.post('/payments/verify', verifyToken, async (req, res) => {
       userEmail: user.email,
       userName: user.name,
       userRole: user.role,
-      planName: 'Pro',
+      planName: user.role === 'tutor' ? 'Pro Tutor' : 'Pro Student',
       amount: (session.amount_total || 0) / 100,
       currency: (session.currency || 'usd').toUpperCase(),
       transactionId: session.payment_intent?.toString() || session.id,
@@ -623,74 +685,8 @@ router.post('/seed', async (req, res) => {
     return res.status(401).json({ message: 'Invalid seed secret.' });
   if (process.env.NODE_ENV === 'production' && !process.env.SEED_SECRET)
     return res.status(403).json({ message: 'Seeding is disabled in production.' });
-  const collections = req.app.locals.collections;
-  if ((await collections.tuitions.countDocuments()) >= 12)
-    return res.json({
-      message: 'Demo data already exists.',
-      count: await collections.tuitions.countDocuments(),
-    });
-
-  const tutors = [
-    ['Rahim Hasan', 'rahim.tutor@example.com'],
-    ['Nusrat Jahan', 'nusrat.tutor@example.com'],
-    ['Tanvir Ahmed', 'tanvir.tutor@example.com'],
-    ['Farhana Islam', 'farhana.tutor@example.com'],
-  ];
-  for (const [name, email] of tutors) {
-    await collections.users.updateOne(
-      { email },
-      {
-        $setOnInsert: {
-          name,
-          email,
-          password: await bcrypt.hash('Password123!', 12),
-          role: 'tutor',
-          phone: '',
-          bio: 'Experienced subject mentor.',
-          image: '',
-          plan: 'free',
-          createdAt: new Date(),
-        },
-      },
-      { upsert: true },
-    );
-  }
-
-  const subjects = [
-    ['Higher Math Mastery', 'Mathematics', 'Class 10', 'Online'],
-    ['Physics for SSC', 'Physics', 'SSC', 'Offline'],
-    ['Programming with JavaScript', 'Programming', 'University', 'Online'],
-    ['IELTS Speaking Practice', 'IELTS', 'Adult', 'Online'],
-    ['Organic Chemistry', 'Chemistry', 'HSC', 'Offline'],
-    ['English Grammar Foundation', 'English', 'Class 8', 'Online'],
-    ['Business Studies', 'Accounting', 'Class 9', 'Offline'],
-    ['Bangla Literature', 'Bangla', 'SSC', 'Online'],
-    ['Biology Revision', 'Biology', 'HSC', 'Offline'],
-    ['Python for Beginners', 'Programming', 'Class 12', 'Online'],
-    ['General Science', 'Science', 'Class 7', 'Offline'],
-    ['SAT Math Preparation', 'Mathematics', 'SAT', 'Online'],
-  ];
-  const docs = subjects.map(([title, subject, classLevel, mode], index) => {
-    const tutor = tutors[index % tutors.length];
-    return {
-      title,
-      subject,
-      classLevel,
-      mode,
-      location: mode === 'Offline' ? 'Dhaka, Bangladesh' : 'Google Meet',
-      monthlyFee: 3000 + (index % 5) * 1000,
-      daysPerWeek: 3 + (index % 3),
-      bannerImage: `https://images.unsplash.com/photo-${1500000000000 + index}?auto=format&fit=crop&w=900&q=80`,
-      description: `A structured ${subject} batch with assignments, tests, and personalized progress feedback.`,
-      tutorName: tutor[0],
-      tutorEmail: tutor[1],
-      approvalStatus: 'approved',
-      isActive: true,
-      createdAt: new Date(Date.now() - index * 86400000),
-    };
-  });
-  const result = await collections.tuitions.insertMany(docs);
-  res.status(201).json({ message: 'Demo data seeded.', count: result.insertedCount });
+  const result = await seedDemoData(req.app.locals.db, req.app.locals.collections);
+  res.status(201).json(result);
 });
 
 export default router;

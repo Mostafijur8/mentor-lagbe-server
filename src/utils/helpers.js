@@ -10,3 +10,8 @@ export function serializeDocument(document) {
   if (!document) return document;
   return { ...document, _id: document._id?.toString() };
 }
+
+// Escapes user input before it is used inside a MongoDB regular expression.
+export function escapeRegex(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
