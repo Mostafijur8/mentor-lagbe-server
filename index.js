@@ -31,6 +31,12 @@ async function startServer() {
       applications: db.collection("applications"),
       payments: db.collection("payments"),
     };
+    await Promise.all([
+      app.locals.collections.users.createIndex({ email: 1 }, { unique: true }),
+      app.locals.collections.tuitions.createIndex({ approvalStatus: 1, isActive: 1, createdAt: -1 }),
+      app.locals.collections.applications.createIndex({ tuitionId: 1, studentEmail: 1 }, { unique: true }),
+      app.locals.collections.payments.createIndex({ stripeSessionId: 1 }, { unique: true }),
+    ]);
 
     const { default: apiRouter } = await import("./src/routes/api.js");
     app.use("/api", express.json({ limit: "2mb" }), apiRouter);
